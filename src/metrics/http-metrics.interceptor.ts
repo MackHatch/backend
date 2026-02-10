@@ -28,27 +28,61 @@ export class HttpMetricsInterceptor implements NestInterceptor {
 
     const start = Date.now();
     const method = (req.method || 'GET').toUpperCase();
-    const route =
+    
+    // Normalize route: replace UUIDs and IDs with :id pattern
+    let route =
       (req.route && req.route.path) ||
-      (req as any).originalUrl ||
+      (req as any).originalUrl?.split('?')[0] ||
       (req.path as string) ||
       'unknown';
+    
+    // Replace UUIDs and common ID patterns with :id
+    route = route.replace(
+      /\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
+      '/:id',
+    );
+    route = route.replace(/\/\d+/g, '/:id');
 
     return next.handle().pipe(
-      tap(() => {
-        const durationMs = Date.now() - start;
-        const status = res.statusCode || 0;
+      tap({
+        next: () => {
+          const durationMs = Date.now() - start;
+          const status = res.statusCode || 0;
 
-        this.metrics.httpRequestsTotal.inc({
-          method,
-          route,
-          status: String(status),
-        });
+          try {
+            this.metrics.httpRequestsTotal.inc({
+              method,
+              route,
+              status: String(status),
+            });
 
-        this.metrics.httpRequestDurationMs.observe(
-          { method, route },
-          durationMs,
-        );
+            this.metrics.httpRequestDurationMs.observe(
+              { method, route },
+              durationMs,
+            );
+          } catch {
+            // Ignore metrics errors to prevent breaking requests
+          }
+        },
+        error: () => {
+          const durationMs = Date.now() - start;
+          const status = res.statusCode || 500;
+
+          try {
+            this.metrics.httpRequestsTotal.inc({
+              method,
+              route,
+              status: String(status),
+            });
+
+            this.metrics.httpRequestDurationMs.observe(
+              { method, route },
+              durationMs,
+            );
+          } catch {
+            // Ignore metrics errors
+          }
+        },
       }),
     );
   }

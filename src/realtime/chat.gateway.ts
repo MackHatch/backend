@@ -55,7 +55,7 @@ export class AgentChatGateway
     private readonly jwtService: JwtService,
     private readonly prisma: PrismaService,
     private readonly rateLimitService: RateLimitService,
-    private readonly metrics: MetricsService,
+    private readonly metrics?: MetricsService,
   ) {}
 
   async afterInit(server: Server): Promise<void> {
@@ -183,7 +183,13 @@ export class AgentChatGateway
       );
 
       // Metrics: count connection by type
-      this.metrics.wsConnectionsTotal.inc({ type: principal.kind });
+      if (env.METRICS_ENABLED && this.metrics) {
+        try {
+          this.metrics.wsConnectionsTotal.inc({ type: principal.kind });
+        } catch {
+          // Ignore metrics errors
+        }
+      }
     } catch (err) {
       // authentication failed
       socket.disconnect(true);
@@ -219,13 +225,22 @@ export class AgentChatGateway
     const principal = await this.getPrincipal(socket);
 
     // Metrics: message count and duration
-    this.metrics.wsMessagesTotal.inc({
-      event: 'conversation.join',
-      actor_type: principal.kind,
-    });
-    const endTimer = this.metrics.wsEventDurationMs.startTimer({
-      event: 'conversation.join',
-    });
+    if (env.METRICS_ENABLED && this.metrics) {
+      try {
+        this.metrics.wsMessagesTotal.inc({
+          event: 'conversation.join',
+          actor_type: principal.kind,
+        });
+      } catch {
+        // Ignore metrics errors
+      }
+    }
+    const endTimer =
+      env.METRICS_ENABLED && this.metrics
+        ? this.metrics.wsEventDurationMs.startTimer({
+            event: 'conversation.join',
+          })
+        : null;
 
     try {
       return await runWithSpan(
@@ -244,6 +259,15 @@ export class AgentChatGateway
         });
 
         if (!conversation) {
+          if (env.METRICS_ENABLED && this.metrics) {
+            try {
+              this.metrics.wsMessageRejectedTotal.inc({
+                reason: 'validation_error',
+              });
+            } catch {
+              // Ignore metrics errors
+            }
+          }
           this.emitError(
             socket,
             'CONVERSATION_NOT_FOUND',
@@ -256,6 +280,15 @@ export class AgentChatGateway
             conversation.customerId !== principal.customerId ||
             conversation.status !== ConversationStatus.OPEN
           ) {
+            if (env.METRICS_ENABLED && this.metrics) {
+              try {
+                this.metrics.wsMessageRejectedTotal.inc({
+                  reason: 'forbidden',
+                });
+              } catch {
+                // Ignore metrics errors
+              }
+            }
             this.emitError(
               socket,
               'FORBIDDEN_CONVERSATION_ACCESS',
@@ -273,7 +306,9 @@ export class AgentChatGateway
       },
     );
     } finally {
-      endTimer();
+      if (endTimer) {
+        endTimer();
+      }
     }
   }
 
@@ -285,48 +320,66 @@ export class AgentChatGateway
     const principal = await this.getPrincipal(socket);
 
     // Metrics: message count and duration
-    this.metrics.wsMessagesTotal.inc({
-      event: 'message.send',
-      actor_type: principal.kind,
-    });
-    const endTimer = this.metrics.wsEventDurationMs.startTimer({
-      event: 'message.send',
-    });
+    if (env.METRICS_ENABLED && this.metrics) {
+      try {
+        this.metrics.wsMessagesTotal.inc({
+          event: 'message.send',
+          actor_type: principal.kind,
+        });
+      } catch {
+        // Ignore metrics errors
+      }
+    }
+    const endTimer =
+      env.METRICS_ENABLED && this.metrics
+        ? this.metrics.wsEventDurationMs.startTimer({
+            event: 'message.send',
+          })
+        : null;
 
     try {
       return await runWithSpan(
-      'ws.message.send',
-      {
-        'conversation.id_hash': hashId(payload.conversationId),
-        actorType: principal.kind,
-        'actor.id_hash': hashId(
-          principal.kind === 'agent' ? principal.userId : principal.customerId,
-        ),
-      },
-      async () => {
-        // Rate limiting (if enabled)
-        if (env.RATE_LIMIT_ENABLED) {
-          const rateLimitKey =
-            principal.kind === 'agent'
-              ? `ws:msg:agent:${principal.userId}`
-              : `ws:msg:cust:${principal.customerId}`;
+        'ws.message.send',
+        {
+          'conversation.id_hash': hashId(payload.conversationId),
+          actorType: principal.kind,
+          'actor.id_hash': hashId(
+            principal.kind === 'agent' ? principal.userId : principal.customerId,
+          ),
+        },
+        async () => {
+          // Rate limiting (if enabled)
+          if (env.RATE_LIMIT_ENABLED) {
+            const rateLimitKey =
+              principal.kind === 'agent'
+                ? `ws:msg:agent:${principal.userId}`
+                : `ws:msg:cust:${principal.customerId}`;
 
-          const rateLimitResult = await this.rateLimitService.consume(
-            rateLimitKey,
-            env.SOCKET_MESSAGE_MAX_PER_10S,
-            10, // 10 second window
-          );
-
-          if (!rateLimitResult.allowed) {
-            const retryAfter = Math.ceil(
-              (rateLimitResult.resetAtMs - Date.now()) / 1000,
+            const rateLimitResult = await this.rateLimitService.consume(
+              rateLimitKey,
+              env.SOCKET_MESSAGE_MAX_PER_10S,
+              10, // 10 second window
             );
-            this.emitError(socket, 'RATE_LIMITED', 'Rate limit exceeded.', {
-              retryAfterSeconds: retryAfter,
-            });
-            return;
+
+            if (!rateLimitResult.allowed) {
+              if (env.METRICS_ENABLED && this.metrics) {
+                try {
+                  this.metrics.wsMessageRejectedTotal.inc({
+                    reason: 'rate_limited',
+                  });
+                } catch {
+                  // Ignore metrics errors
+                }
+              }
+              const retryAfter = Math.ceil(
+                (rateLimitResult.resetAtMs - Date.now()) / 1000,
+              );
+              this.emitError(socket, 'RATE_LIMITED', 'Rate limit exceeded.', {
+                retryAfterSeconds: retryAfter,
+              });
+              return;
+            }
           }
-        }
 
         const conversation = await this.prisma.conversation.findUnique({
           where: { id: payload.conversationId },
@@ -340,6 +393,15 @@ export class AgentChatGateway
         });
 
         if (!conversation) {
+          if (env.METRICS_ENABLED && this.metrics) {
+            try {
+              this.metrics.wsMessageRejectedTotal.inc({
+                reason: 'validation_error',
+              });
+            } catch {
+              // Ignore metrics errors
+            }
+          }
           this.emitError(
             socket,
             'CONVERSATION_NOT_FOUND',
@@ -348,6 +410,15 @@ export class AgentChatGateway
         }
 
         if (conversation.status === ConversationStatus.CLOSED) {
+          if (env.METRICS_ENABLED && this.metrics) {
+            try {
+              this.metrics.wsMessageRejectedTotal.inc({
+                reason: 'validation_error',
+              });
+            } catch {
+              // Ignore metrics errors
+            }
+          }
           this.emitError(
             socket,
             'CONVERSATION_CLOSED',
@@ -472,7 +543,14 @@ export class AgentChatGateway
       });
     }
 
-    return { ok: true };
+        return { ok: true };
+      },
+    );
+    } finally {
+      if (endTimer) {
+        endTimer();
+      }
+    }
   }
 
   @SubscribeMessage('conversation.claim')
@@ -482,15 +560,34 @@ export class AgentChatGateway
   ) {
     const agent = await this.getAgentFromSocket(socket);
 
-    return await runWithSpan(
-      'ws.conversation.claim',
-      {
-        'conversation.id_hash': hashId(payload.conversationId),
-        actorType: 'agent',
-        'actor.id_hash': hashId(agent.userId),
-      },
-      async () => {
-        try {
+    // Metrics: message count and duration
+    if (env.METRICS_ENABLED && this.metrics) {
+      try {
+        this.metrics.wsMessagesTotal.inc({
+          event: 'conversation.claim',
+          actor_type: 'agent',
+        });
+      } catch {
+        // Ignore metrics errors
+      }
+    }
+    const endTimer =
+      env.METRICS_ENABLED && this.metrics
+        ? this.metrics.wsEventDurationMs.startTimer({
+            event: 'conversation.claim',
+          })
+        : null;
+
+    try {
+      return await runWithSpan(
+        'ws.conversation.claim',
+        {
+          'conversation.id_hash': hashId(payload.conversationId),
+          actorType: 'agent',
+          'actor.id_hash': hashId(agent.userId),
+        },
+        async () => {
+          try {
       const updated = await this.prisma.$transaction(async (tx) => {
         const convo = await tx.conversation.findUnique({
           where: { id: payload.conversationId },
@@ -578,17 +675,28 @@ export class AgentChatGateway
         },
       });
 
-          return { ok: true };
-        } catch (err) {
-          if (err instanceof WsException) {
-            throw err;
+            return { ok: true };
+          } catch (err) {
+            if (err instanceof WsException) {
+              throw err;
+            }
+            if (env.METRICS_ENABLED && this.metrics) {
+              try {
+                this.metrics.wsMessageRejectedTotal.inc({
+                  reason: 'internal_error',
+                });
+              } catch {
+                // Ignore metrics errors
+              }
+            }
+            this.emitError(socket, 'CONVERSATION_CLAIM_FAILED', 'Failed to claim conversation.');
           }
-          this.emitError(socket, 'CONVERSATION_CLAIM_FAILED', 'Failed to claim conversation.');
-        }
-      },
-    );
+        },
+      );
     } finally {
-      endTimer();
+      if (endTimer) {
+        endTimer();
+      }
     }
   }
 
@@ -599,15 +707,34 @@ export class AgentChatGateway
   ) {
     const agent = await this.getAgentFromSocket(socket);
 
-    return await runWithSpan(
-      'ws.conversation.close',
-      {
-        'conversation.id_hash': hashId(payload.conversationId),
-        actorType: 'agent',
-        'actor.id_hash': hashId(agent.userId),
-      },
-      async () => {
-        try {
+    // Metrics: message count and duration
+    if (env.METRICS_ENABLED && this.metrics) {
+      try {
+        this.metrics.wsMessagesTotal.inc({
+          event: 'conversation.close',
+          actor_type: 'agent',
+        });
+      } catch {
+        // Ignore metrics errors
+      }
+    }
+    const endTimer =
+      env.METRICS_ENABLED && this.metrics
+        ? this.metrics.wsEventDurationMs.startTimer({
+            event: 'conversation.close',
+          })
+        : null;
+
+    try {
+      return await runWithSpan(
+        'ws.conversation.close',
+        {
+          'conversation.id_hash': hashId(payload.conversationId),
+          actorType: 'agent',
+          'actor.id_hash': hashId(agent.userId),
+        },
+        async () => {
+          try {
       const updated = await this.prisma.$transaction(async (tx) => {
         const convo = await tx.conversation.findUnique({
           where: { id: payload.conversationId },
@@ -755,6 +882,7 @@ export class AgentChatGateway
         });
       },
     );
+    // Note: Typing events are lightweight, no metrics needed
   }
 
   @SubscribeMessage('typing.stop')
@@ -788,6 +916,7 @@ export class AgentChatGateway
         });
       },
     );
+    // Note: Typing events are lightweight, no metrics needed
   }
 }
 

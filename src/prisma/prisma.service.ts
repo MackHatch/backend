@@ -8,7 +8,7 @@ export class PrismaService
   extends PrismaClient
   implements OnModuleInit, OnModuleDestroy
 {
-  constructor(private readonly metrics: MetricsService) {
+  constructor(private readonly metrics?: MetricsService) {
     super({
       datasources: {
         db: {
@@ -17,7 +17,7 @@ export class PrismaService
       },
     });
 
-    if (env.METRICS_ENABLED) {
+    if (env.METRICS_ENABLED && this.metrics) {
       this.$use(async (params, next) => {
         const start = Date.now();
         try {
@@ -26,11 +26,15 @@ export class PrismaService
           const model = params.model ?? 'raw';
           const action = params.action ?? 'unknown';
 
-          this.metrics.prismaQueryTotal.inc({ model, action });
-          this.metrics.prismaQueryDurationMs.observe(
-            { model, action },
-            durationMs,
-          );
+          try {
+            this.metrics.prismaQueryTotal.inc({ model, action });
+            this.metrics.prismaQueryDurationMs.observe(
+              { model, action },
+              durationMs,
+            );
+          } catch {
+            // Ignore metrics errors
+          }
 
           return result;
         } catch (error) {
@@ -38,11 +42,15 @@ export class PrismaService
           const model = params.model ?? 'raw';
           const action = params.action ?? 'unknown';
 
-          this.metrics.prismaQueryTotal.inc({ model, action });
-          this.metrics.prismaQueryDurationMs.observe(
-            { model, action },
-            durationMs,
-          );
+          try {
+            this.metrics.prismaQueryTotal.inc({ model, action });
+            this.metrics.prismaQueryDurationMs.observe(
+              { model, action },
+              durationMs,
+            );
+          } catch {
+            // Ignore metrics errors
+          }
 
           throw error;
         }
